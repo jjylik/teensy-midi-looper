@@ -5,24 +5,29 @@ MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI1);
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial2, MIDI2);
 
 const int RESET_BUTTON_PIN = 2;
+const int LOOP_LENGHT_PIN = 21;
 const int RECORD_LED_PIN = 3;
-Bounce pushbutton = Bounce(RESET_BUTTON_PIN, 10);  // 10 ms debounce
+const int TEMPO_LED_PIN = 5;
+Bounce resetButton = Bounce(RESET_BUTTON_PIN, 10);
+Bounce loopLengthButton = Bounce(LOOP_LENGHT_PIN, 20);
 
-const int LOOP_BARS = 4;
 
+int loopBars = 2;
+ 
 int notesOnCount = 0;
 int tempoMessageCount;
+int tempoOnBlinkCount = 0;
 boolean looping = false;
-boolean recording = false;
+boolean recording = true;
 int currentBar = 0;
-boolean onRecordingLoop = true;
-boolean notifyClear = false;
 int blinkCounter = 0;
 byte ledStatus = HIGH;
 
-byte noteOnOnTempo[386][16];
-byte noteOffOnTempo[386][16];
-int noteStartPosOffset[200];
+const int SYNC_MESSAGE_MAX = 1632; // 17 bars * 96 sync messages
+
+byte noteOnOnTempo[SYNC_MESSAGE_MAX][8];
+byte noteOffOnTempo[SYNC_MESSAGE_MAX][8];
+int noteStartPosOffset[SYNC_MESSAGE_MAX];
 
 void setup() {
   Serial.begin(115200);
@@ -30,8 +35,9 @@ void setup() {
   MIDI2.begin(MIDI_CHANNEL_OMNI);
   tempoMessageCount = 0;
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LOOP_LENGHT_PIN, INPUT_PULLUP);
   pinMode(RECORD_LED_PIN, OUTPUT);
-
+  pinMode(TEMPO_LED_PIN, OUTPUT);
 }
 
 void handle_midi_start_stop(midi::MidiType mtype, byte data1, byte data2) {
@@ -54,7 +60,7 @@ void clear_notes() {
    MIDI1.send((midi::MidiType)0xB0, 0x78, 0, 2);
    MIDI1.send((midi::MidiType)0xB0, 0x7B, 0, 2);
    memset(noteStartPosOffset, 0, sizeof(noteStartPosOffset));
-   for (int i = 0; i < 386; i++) {
+   for (int i = 0; i < SYNC_MESSAGE_MAX; i++) {
       memset(noteOffOnTempo[i], 0, sizeof(noteOffOnTempo[i]));
       memset(noteOnOnTempo[i], 0, sizeof(noteOnOnTempo[i]));
    }
@@ -67,7 +73,7 @@ void handle_midi_note(midi::MidiType mtype, byte data1, byte data2) {
     if (mtype == midi::NoteOff) {
       int note = (int) data1;
       int quantizedOffset = noteStartPosOffset[note] + tempoMessageCount;
-      append_to_list(noteOffOnTempo[quantizedOffset], data1);
+      append_to_note_list(noteOffOnTempo[quantizedOffset], data1);
       if (notesOnCount > 0) {
             notesOnCount--;
       }
@@ -75,13 +81,13 @@ void handle_midi_note(midi::MidiType mtype, byte data1, byte data2) {
        int quantized = quantize_note(tempoMessageCount);
        int note = (int) data1;
        noteStartPosOffset[note] = quantized - tempoMessageCount;
-       append_to_list(noteOnOnTempo[quantized], data1);
+       append_to_note_list(noteOnOnTempo[quantized], data1);
        notesOnCount++;
     }
 }
 
-void append_to_list(byte list[], byte value) {
-  for (int i = 0; i < 16; i++) {
+void append_to_note_list(byte list[], byte value) {
+  for (int i = 0; i < 8; i++) {
     if (list[i] == 0) {
       list[i]= value;
       break;
@@ -95,10 +101,8 @@ int quantize_note(int n) {
 
 void loop() {
   read_record_button();
-
-  // MIDI from sync port
+  read_tempo_button();
   read_sync_midi();
-
   read_device_midi();
 }
 
@@ -132,6 +136,7 @@ void read_sync_midi() {
     if (mtype == midi::Clock) {
       blink_recording_led();
       if (looping) {
+        tempoOnBlinkCount--;
         tempoMessageCount++;
         // if note message on current sync message, write it to midi out
         if (notesOnCount == 0 && noteOnOnTempo[tempoMessageCount][0] != 0) {
@@ -153,9 +158,20 @@ void read_sync_midi() {
           }
         }
         // One bar == 96 sync messages
-        if (tempoMessageCount >= 96*LOOP_BARS) {
+        if (tempoMessageCount >= 96*loopBars) {
            tempoMessageCount = 0;
         }
+        int blinkFreq = 24;
+        if (tempoMessageCount >= 96*(loopBars-1)) {
+          blinkFreq = 12;
+        }
+        if (tempoMessageCount % blinkFreq == 0) {
+            digitalWrite(TEMPO_LED_PIN, HIGH);
+            tempoOnBlinkCount = 3;
+       }
+        if (tempoOnBlinkCount == 0) {
+           digitalWrite(TEMPO_LED_PIN, LOW);
+       }
       }
     }
   }
@@ -185,9 +201,7 @@ void blink_recording_led() {
 //
 // TODO move to own file
 //
-unsigned int count = 0;
-unsigned long countAt = 0;
-unsigned int countPrinted = 0;
+
 
 #define shortTime 500
 #define longTime 900
@@ -195,17 +209,16 @@ unsigned int countPrinted = 0;
 unsigned long buttonPressStartTimeStamp;
 unsigned long buttonPressDuration = 0;
 boolean startTimeout = false;
-boolean endTimeout = false;
 
 void read_record_button()
 {
-  pushbutton.update();
-  if (pushbutton.fallingEdge())
+  resetButton.update();
+  if (resetButton.fallingEdge())
   {
     buttonPressStartTimeStamp = millis();
     startTimeout = true;
   }
-  if (pushbutton.risingEdge())
+  if (resetButton.risingEdge())
   {
     buttonPressDuration = (millis() - buttonPressStartTimeStamp);
     startTimeout = false;
@@ -230,6 +243,39 @@ void read_record_button()
     blinkCounter = 6;
     startTimeout = false;
     buttonPressDuration = 0;
+  }
+}
+
+
+//TODO move to own file 
+
+unsigned long button2PressStartTimeStamp;
+unsigned long button2PressDuration = 0;
+boolean start2Timeout = false;
+
+void read_tempo_button()
+{
+  loopLengthButton.update();
+  if (loopLengthButton.fallingEdge())
+  {
+    button2PressStartTimeStamp = millis();
+    start2Timeout = true;
+  }
+  if (loopLengthButton.risingEdge())
+  {
+    button2PressDuration = (millis() - button2PressStartTimeStamp);
+    start2Timeout = false;
+  }
+
+  // start / stop recording on normal press
+  if (button2PressDuration > 0 && button2PressDuration <= longTime)
+  {
+    if (loopBars < 16) {
+      loopBars = loopBars * 2;
+    } else {
+      loopBars = 1;
+    }
+    button2PressDuration = 0;
   }
 
 }
